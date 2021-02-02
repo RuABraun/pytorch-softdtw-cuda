@@ -26,12 +26,13 @@ import torch
 import torch.cuda
 from numba import jit
 from torch.autograd import Function
+from loguru import logger
 from numba import cuda
 import math
 
 # ----------------------------------------------------------------------------------------------------------------------
 @cuda.jit
-def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R):
+def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R, x_lens, y_lens):
     """
     :param seq_len: The length of the sequence (both inputs are assumed to be of the same size)
     :param n_passes: 2 * seq_len - 1 (The number of anti-diagonals)
@@ -61,22 +62,25 @@ def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R):
 
         # Only compute if element[i, j] is on the current anti-diagonal, and also is within bounds
         if I + J == p and (I < max_i and J < max_j):
+
             # Don't compute if outside bandwidth
             if not (abs(i - j) > bandwidth > 0):
-                r0 = -R[b, i - 1, j - 1] * inv_gamma
-                r1 = -R[b, i - 1, j] * inv_gamma
-                r2 = -R[b, i, j - 1] * inv_gamma
-                rmax = max(max(r0, r1), r2)
-                rsum = math.exp(r0 - rmax) + math.exp(r1 - rmax) + math.exp(r2 - rmax)
-                softmin = -gamma * (math.log(rsum) + rmax)
-                R[b, i, j] = D[b, i - 1, j - 1] + softmin
+                if i <= x_lens[b] and j <= y_lens[b]:
+                    r0 = -R[b, i - 1, j - 1] * inv_gamma
+                    r1 = -R[b, i - 1, j] * inv_gamma
+                    r2 = -R[b, i, j - 1] * inv_gamma
+                    rmax = max(max(r0, r1), r2)
+                    rsum = math.exp(r0 - rmax) + math.exp(r1 - rmax) + math.exp(r2 - rmax)
+                    softmin = -gamma * (math.log(rsum) + rmax)
+                    R[b, i, j] = D[b, i - 1, j - 1] + softmin
 
         # Wait for other threads in this block
         cuda.syncthreads()
 
 # ----------------------------------------------------------------------------------------------------------------------
 @cuda.jit
-def compute_softdtw_backward_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_passes, E):
+def compute_softdtw_backward_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_passes, E,
+                                  x_lens, y_lens):
     k = cuda.blockIdx.x
     tid = cuda.threadIdx.x
 
@@ -102,10 +106,11 @@ def compute_softdtw_backward_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_pa
 
             # Don't compute if outside bandwidth
             if not (abs(i - j) > bandwidth > 0):
-                a = math.exp((R[k, i + 1, j] - R[k, i, j] - D[k, i + 1, j]) * inv_gamma)
-                b = math.exp((R[k, i, j + 1] - R[k, i, j] - D[k, i, j + 1]) * inv_gamma)
-                c = math.exp((R[k, i + 1, j + 1] - R[k, i, j] - D[k, i + 1, j + 1]) * inv_gamma)
-                E[k, i, j] = E[k, i + 1, j] * a + E[k, i, j + 1] * b + E[k, i + 1, j + 1] * c
+                if i <= x_lens[k] and j <= y_lens[k]:
+                    a = math.exp((R[k, i + 1, j] - R[k, i, j] - D[k, i + 1, j]) * inv_gamma)
+                    b = math.exp((R[k, i, j + 1] - R[k, i, j] - D[k, i, j + 1]) * inv_gamma)
+                    c = math.exp((R[k, i + 1, j + 1] - R[k, i, j] - D[k, i + 1, j + 1]) * inv_gamma)
+                    E[k, i, j] = E[k, i + 1, j] * a + E[k, i, j + 1] * b + E[k, i + 1, j + 1] * c
 
         # Wait for other threads in this block
         cuda.syncthreads()
@@ -118,7 +123,7 @@ class _SoftDTWCUDA(Function):
     """
 
     @staticmethod
-    def forward(ctx, D, gamma, bandwidth):
+    def forward(ctx, D, gamma, bandwidth, x_lens, y_lens):
         dev = D.device
         dtype = D.dtype
         gamma = torch.cuda.FloatTensor([gamma])
@@ -137,17 +142,21 @@ class _SoftDTWCUDA(Function):
         # Run the CUDA kernel.
         # Set CUDA's grid size to be equal to the batch size (every CUDA block processes one sample pair)
         # Set the CUDA block size to be equal to the length of the longer sequence (equal to the size of the largest diagonal)
+        logger.info(B)
+        logger.info(threads_per_block)
         compute_softdtw_cuda[B, threads_per_block](cuda.as_cuda_array(D.detach()),
                                                    gamma.item(), bandwidth.item(), N, M, n_passes,
-                                                   cuda.as_cuda_array(R))
-        ctx.save_for_backward(D, R, gamma, bandwidth)
-        return R[:, -2, -2]
+                                                   cuda.as_cuda_array(R), cuda.as_cuda_array(x_lens),
+                                                   cuda.as_cuda_array(y_lens))
+        ctx.save_for_backward(D, R, gamma, bandwidth, x_lens, y_lens)
+        arange = torch.arange(B, device=dev)
+        return R[arange, x_lens, y_lens]
 
     @staticmethod
     def backward(ctx, grad_output):
         dev = grad_output.device
         dtype = grad_output.dtype
-        D, R, gamma, bandwidth = ctx.saved_tensors
+        D, R, gamma, bandwidth, x_lens, y_lens = ctx.saved_tensors
 
         B = D.shape[0]
         N = D.shape[1]
@@ -165,13 +174,21 @@ class _SoftDTWCUDA(Function):
         E = torch.zeros((B, N + 2, M + 2), dtype=dtype, device=dev)
         E[:, -1, -1] = 1
 
+        arange = torch.arange(B, device=dev)
+        E[arange, x_lens+1, y_lens+1] = 1
+        R[arange, x_lens+1, y_lens+1] = R[arange, x_lens, y_lens]
+
         # Grid and block sizes are set same as done above for the forward() call
+        logger.info(B)
+        logger.info(threads_per_block)
         compute_softdtw_backward_cuda[B, threads_per_block](cuda.as_cuda_array(D_),
                                                             cuda.as_cuda_array(R),
                                                             1.0 / gamma.item(), bandwidth.item(), N, M, n_passes,
-                                                            cuda.as_cuda_array(E))
+                                                            cuda.as_cuda_array(E),
+                                                            cuda.as_cuda_array(x_lens),
+                                                            cuda.as_cuda_array(y_lens))
         E = E[:, 1:N + 1, 1:M + 1]
-        return grad_output.view(-1, 1, 1).expand_as(E) * E, None, None
+        return grad_output.view(-1, 1, 1).expand_as(E) * E, None, None, None, None
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -182,7 +199,7 @@ class _SoftDTWCUDA(Function):
 #
 # ----------------------------------------------------------------------------------------------------------------------
 @jit(nopython=True)
-def compute_softdtw(D, gamma, bandwidth):
+def compute_softdtw(D, gamma, bandwidth, x_lens, y_lens):
     B = D.shape[0]
     N = D.shape[1]
     M = D.shape[2]
@@ -190,10 +207,14 @@ def compute_softdtw(D, gamma, bandwidth):
     R[:, 0, 0] = 0
     for b in range(B):
         for j in range(1, M + 1):
+            if j > y_lens[b]:
+                continue
             for i in range(1, N + 1):
 
                 # Check the pruning condition
                 if 0 < bandwidth < np.abs(i - j):
+                    continue
+                if i > x_lens[b]:
                     continue
 
                 r0 = -R[b, i - 1, j - 1] / gamma
@@ -207,23 +228,30 @@ def compute_softdtw(D, gamma, bandwidth):
 
 # ----------------------------------------------------------------------------------------------------------------------
 @jit(nopython=True)
-def compute_softdtw_backward(D_, R, gamma, bandwidth):
+def compute_softdtw_backward(D_, R, gamma, bandwidth, x_lens, y_lens):
     B = D_.shape[0]
     N = D_.shape[1]
     M = D_.shape[2]
     D = np.zeros((B, N + 2, M + 2))
     E = np.zeros((B, N + 2, M + 2))
     D[:, 1:N + 1, 1:M + 1] = D_
-    E[:, -1, -1] = 1
     R[:, :, -1] = -np.inf
     R[:, -1, :] = -np.inf
     R[:, -1, -1] = R[:, -2, -2]
+    for n in range(x_lens.shape[0]):
+        E[n, x_lens[n]+1, y_lens[n]+1] = 1
+        R[n, x_lens[n]+1, y_lens[n]+1] = R[n, x_lens[n], y_lens[n]]
+    #E[:, x_lens+1, y_lens+1] = 1
     for k in range(B):
         for j in range(M, 0, -1):
+            if j > y_lens[k]:
+                continue
             for i in range(N, 0, -1):
 
                 if np.isinf(R[k, i, j]):
                     R[k, i, j] = -np.inf
+                if i > x_lens[k]:
+                    continue
 
                 # Check the pruning condition
                 if 0 < bandwidth < np.abs(i - j):
@@ -245,29 +273,35 @@ class _SoftDTW(Function):
     """
 
     @staticmethod
-    def forward(ctx, D, gamma, bandwidth):
+    def forward(ctx, D, gamma, bandwidth, x_lens, y_lens):
         dev = D.device
         dtype = D.dtype
         gamma = torch.Tensor([gamma]).to(dev).type(dtype)  # dtype fixed
         bandwidth = torch.Tensor([bandwidth]).to(dev).type(dtype)
         D_ = D.detach().cpu().numpy()
+        x_lens_ = x_lens
+        y_lens_ = y_lens
+        if x_lens is not None:
+            x_lens_ = x_lens.numpy()
+        if y_lens is not None:
+            y_lens_ = y_lens.numpy()
         g_ = gamma.item()
         b_ = bandwidth.item()
-        R = torch.Tensor(compute_softdtw(D_, g_, b_)).to(dev).type(dtype)
-        ctx.save_for_backward(D, R, gamma, bandwidth)
-        return R[:, -2, -2]
+        R = torch.Tensor(compute_softdtw(D_, g_, b_, x_lens_, y_lens_)).to(dev).type(dtype)
+        ctx.save_for_backward(D, R, gamma, bandwidth, x_lens, y_lens)
+        return R[torch.arange(x_lens.numel()), x_lens, y_lens]
 
     @staticmethod
     def backward(ctx, grad_output):
         dev = grad_output.device
         dtype = grad_output.dtype
-        D, R, gamma, bandwidth = ctx.saved_tensors
+        D, R, gamma, bandwidth, x_lens, y_lens = ctx.saved_tensors
         D_ = D.detach().cpu().numpy()
         R_ = R.detach().cpu().numpy()
         g_ = gamma.item()
         b_ = bandwidth.item()
-        E = torch.Tensor(compute_softdtw_backward(D_, R_, g_, b_)).to(dev).type(dtype)
-        return grad_output.view(-1, 1, 1).expand_as(E) * E, None, None
+        E = torch.Tensor(compute_softdtw_backward(D_, R_, g_, b_, x_lens.numpy(), y_lens.numpy())).to(dev).type(dtype)
+        return grad_output.view(-1, 1, 1).expand_as(E) * E, None, None, None, None
 
 # ----------------------------------------------------------------------------------------------------------------------
 class SoftDTW(torch.nn.Module):
@@ -321,14 +355,9 @@ class SoftDTW(torch.nn.Module):
         """
         Calculates the Euclidean distance between each element in x and y per timestep
         """
-        n = x.size(1)
-        m = y.size(1)
-        d = x.size(2)
-        x = x.unsqueeze(2).expand(-1, n, m, d)
-        y = y.unsqueeze(1).expand(-1, n, m, d)
-        return torch.pow(x - y, 2).sum(3)
+        return torch.cdist(x, y)
 
-    def forward(self, X, Y):
+    def forward(self, X, Y, X_lens, Y_lens):
         """
         Compute the soft-DTW value between X and Y
         :param X: One batch of examples, batch_size x seq_len x dims
@@ -343,13 +372,15 @@ class SoftDTW(torch.nn.Module):
             # Stack everything up and run
             x = torch.cat([X, X, Y])
             y = torch.cat([Y, X, Y])
+            x_lens = torch.cat([X_lens, X_lens, Y_lens])
+            y_lens = torch.cat([Y_lens, X_lens, Y_lens])
             D = self.dist_func(x, y)
-            out = func_dtw(D, self.gamma, self.bandwidth)
+            out = func_dtw(D, self.gamma, self.bandwidth, x_lens, y_lens)
             out_xy, out_xx, out_yy = torch.split(out, X.shape[0])
             return out_xy - 1 / 2 * (out_xx + out_yy)
         else:
             D_xy = self.dist_func(X, Y)
-            return func_dtw(D_xy, self.gamma, self.bandwidth)
+            return func_dtw(D_xy, self.gamma, self.bandwidth, X_lens, Y_lens)
 
 # ----------------------------------------------------------------------------------------------------------------------
 def timed_run(a, b, sdtw):
